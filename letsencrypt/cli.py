@@ -12,7 +12,6 @@ import time
 import traceback
 
 import configargparse
-import configobj
 import OpenSSL
 import zope.component
 import zope.interface.exceptions
@@ -54,11 +53,7 @@ SHORT_USAGE = """
 
 The Let's Encrypt agent can obtain and install HTTPS/TLS/SSL certificates.  By
 default, it will attempt to use a webserver both for obtaining and installing
-the cert.  """
-
-# This is the short help for letsencrypt --help, where we disable argparse
-# altogether
-USAGE = SHORT_USAGE + """Major SUBCOMMANDS are:
+the cert. Major SUBCOMMANDS are:
 
   (default) run        Obtain & install a cert in your current webserver
   auth                 Authenticate & obtain cert, but do not install it
@@ -67,7 +62,12 @@ USAGE = SHORT_USAGE + """Major SUBCOMMANDS are:
   rollback             Rollback server configuration changes made during install
   config_changes       Show changes made to server config during installation
 
-Choice of server for authentication/installation:
+"""
+
+
+# This is the short help for letsencrypt --help, where we disable argparse
+# altogether
+USAGE = SHORT_USAGE + """Choice of server for authentication/installation:
 
   --apache          Use the Apache plugin for authentication & installation
   --nginx           Use the Nginx plugin for authentication & installation
@@ -167,25 +167,21 @@ def _init_le_client(args, config, authenticator, installer):
     return client.Client(config, acc, authenticator, installer, acme=acme)
 
 
-def _find_duplicative_certs(domains, config, renew_config):
+def _find_duplicative_certs(config, domains):
     """Find existing certs that duplicate the request."""
 
     identical_names_cert, subset_names_cert = None, None
 
-    configs_dir = renew_config.renewal_configs_dir
+    cli_config = configuration.RenewerConfiguration(config)
+    configs_dir = cli_config.renewal_configs_dir
     # Verify the directory is there
     le_util.make_or_verify_dir(configs_dir, mode=0o755, uid=os.geteuid())
 
-    cli_config = configuration.RenewerConfiguration(config)
     for renewal_file in os.listdir(configs_dir):
         try:
             full_path = os.path.join(configs_dir, renewal_file)
-            rc_config = configobj.ConfigObj(renew_config.renewer_config_file)
-            rc_config.merge(configobj.ConfigObj(full_path))
-            rc_config.filename = full_path
-            candidate_lineage = storage.RenewableCert(
-                rc_config, config_opts=None, cli_config=cli_config)
-        except (configobj.ConfigObjError, CertStorageError, IOError):
+            candidate_lineage = storage.RenewableCert(full_path, cli_config)
+        except (CertStorageError, IOError):
             logger.warning("Renewal configuration file %s is broken. "
                            "Skipping.", full_path)
             continue
@@ -217,7 +213,7 @@ def _treat_as_renewal(config, domains):
     # kind of certificate to be obtained with renewal = False.)
     if not config.duplicate:
         ident_names_cert, subset_names_cert = _find_duplicative_certs(
-            domains, config, configuration.RenewerConfiguration(config))
+            config, domains)
         # I am not sure whether that correctly reads the systemwide
         # configuration file.
         question = None
@@ -267,16 +263,31 @@ def _treat_as_renewal(config, domains):
     return None
 
 
-def _report_new_cert(cert_path):
-    """Reports the creation of a new certificate to the user."""
+def _report_new_cert(cert_path, fullchain_path):
+    """Reports the creation of a new certificate to the user.
+
+    :param str cert_path: path to cert
+    :param str fullchain_path: path to full chain
+
+    """
     expiry = crypto_util.notAfter(cert_path).date()
     reporter_util = zope.component.getUtility(interfaces.IReporter)
-    reporter_util.add_message("Congratulations! Your certificate has been "
-                              "saved at {0} and will expire on {1}. To obtain "
-                              "a new version of the certificate in the "
-                              "future, simply run Let's Encrypt again.".format(
-                                  cert_path, expiry),
-                              reporter_util.MEDIUM_PRIORITY)
+    if fullchain_path:
+        # Print the path to fullchain.pem because that's what modern webservers
+        # (Nginx and Apache2.4) will want.
+        and_chain = "and chain have"
+        path = fullchain_path
+    else:
+        # Unless we're in .csr mode and there really isn't one
+        and_chain = "has "
+        path = cert_path
+    # XXX Perhaps one day we could detect the presence of known old webservers
+    # and say something more informative here.
+    msg = ("Congratulations! Your certificate {0} been saved at {1}."
+           " Your cert will expire on {2}. To obtain a new version of the "
+           "certificate in the future, simply run Let's Encrypt again."
+           .format(and_chain, path, expiry))
+    reporter_util.add_message(msg, reporter_util.MEDIUM_PRIORITY)
 
 
 def _auth_from_domains(le_client, config, domains, plugins):
@@ -304,7 +315,7 @@ def _auth_from_domains(le_client, config, domains, plugins):
         if not lineage:
             raise Error("Certificate could not be obtained")
 
-    _report_new_cert(lineage.cert)
+    _report_new_cert(lineage.cert, lineage.fullchain)
 
     return lineage
 
@@ -312,8 +323,8 @@ def _auth_from_domains(le_client, config, domains, plugins):
 def set_configurator(previously, now):
     """
     Setting configurators multiple ways is okay, as long as they all agree
-    :param string previously: previously identified request for the installer/authenticator
-    :param string requested: the request currently being processed
+    :param str previously: previously identified request for the installer/authenticator
+    :param str requested: the request currently being processed
     """
     if now is None:
         # we're not actually setting anything
@@ -329,9 +340,9 @@ def diagnose_configurator_problem(cfg_type, requested, plugins):
     """
     Raise the most helpful error message about a plugin being unavailable
 
-    :param string cfg_type: either "installer" or "authenticator"
-    :param string requested: the plugin that was requested
-    :param PluginRegistry plugins: available plugins
+    :param str cfg_type: either "installer" or "authenticator"
+    :param str requested: the plugin that was requested
+    :param .PluginsRegistry plugins: available plugins
 
     :raises error.PluginSelectionError: if there was a problem
     """
@@ -341,7 +352,8 @@ def diagnose_configurator_problem(cfg_type, requested, plugins):
             msg = "The requested {0} plugin does not appear to be installed".format(requested)
         else:
             msg = ("The {0} plugin is not working; there may be problems with "
-                   "your existing configuration").format(requested)
+                   "your existing configuration.\nThe error was: {1!r}"
+                   .format(requested, plugins[requested].problem))
     elif cfg_type == "installer":
         if os.path.exists("/etc/debian_version"):
             # Debian... installers are at least possible
@@ -426,6 +438,7 @@ def run(args, config, plugins):  # pylint: disable=too-many-branches,too-many-lo
     le_client.deploy_certificate(
         domains, lineage.privkey, lineage.cert,
         lineage.chain, lineage.fullchain)
+
     le_client.enhance_config(domains, args.redirect)
 
     if len(lineage.available_versions("cert")) == 1:
@@ -455,9 +468,9 @@ def auth(args, config, plugins):
     if args.csr is not None:
         certr, chain = le_client.obtain_certificate_from_csr(le_util.CSR(
             file=args.csr[0], data=args.csr[1], form="der"))
-        cert_path, _ = le_client.save_certificate(
-            certr, chain, args.cert_path, args.chain_path)
-        _report_new_cert(cert_path)
+        cert_path, _, cert_fullchain = le_client.save_certificate(
+            certr, chain, args.cert_path, args.chain_path, args.fullchain_path)
+        _report_new_cert(cert_path, cert_fullchain)
     else:
         domains = _find_domains(args, installer)
         _auth_from_domains(le_client, config, domains, plugins)
@@ -594,9 +607,19 @@ class HelpfulArgumentParser(object):
     'letsencrypt --help security' for security options.
 
     """
+
+    # Maps verbs/subcommands to the functions that implement them
+    VERBS = {"auth": auth, "config_changes": config_changes,
+             "install": install, "plugins": plugins_cmd,
+             "revoke": revoke, "rollback": rollback, "run": run}
+
+    # List of topics for which additional help can be provided
+    HELP_TOPICS = ["all", "security",
+                   "paths", "automation", "testing"] + VERBS.keys()
+
     def __init__(self, args, plugins):
         plugin_names = [name for name, _p in plugins.iteritems()]
-        self.help_topics = HELP_TOPICS + plugin_names + [None]
+        self.help_topics = self.HELP_TOPICS + plugin_names + [None]
         self.parser = configargparse.ArgParser(
             usage=SHORT_USAGE,
             formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -607,8 +630,8 @@ class HelpfulArgumentParser(object):
         self.parser._add_config_file_help = False  # pylint: disable=protected-access
         self.silent_parser = SilentParser(self.parser)
 
-        self.verb = None
-        self.args = self.preprocess_args(args)
+        self.args = args
+        self.determine_verb()
         help1 = self.prescan_for_flag("-h", self.help_topics)
         help2 = self.prescan_for_flag("--help", self.help_topics)
         assert max(True, "a") == "a", "Gravity changed direction"
@@ -621,25 +644,36 @@ class HelpfulArgumentParser(object):
         #print self.visible_topics
         self.groups = {}  # elements are added by .add_group()
 
-    def preprocess_args(self, args):
-        """Work around some limitations in argparse.
+    def parse_args(self):
+        """Parses command line arguments and returns the result.
 
-        Currently: add the default verb "run" as a default, and ensure that the
-        subcommand / verb comes last.
+        :returns: parsed command line arguments
+        :rtype: argparse.Namespace
+
         """
-        if "-h" in args or "--help" in args:
+        parsed_args = self.parser.parse_args(self.args)
+        parsed_args.func = self.VERBS[self.verb]
+
+        return parsed_args
+
+    def determine_verb(self):
+        """Determines the verb/subcommand provided by the user.
+
+        This function works around some of the limitations of argparse.
+
+        """
+        if "-h" in self.args or "--help" in self.args:
             # all verbs double as help arguments; don't get them confused
             self.verb = "help"
-            return args
+            return
 
-        for i, token in enumerate(args):
-            if token in VERBS:
-                reordered = args[:i] + args[(i + 1):] + [args[i]]
+        for i, token in enumerate(self.args):
+            if token in self.VERBS:
                 self.verb = token
-                return reordered
+                self.args.pop(i)
+                return
 
         self.verb = "run"
-        return args + ["run"]
 
     def prescan_for_flag(self, flag, possible_arguments):
         """Checks cli input for flags.
@@ -728,8 +762,16 @@ class HelpfulArgumentParser(object):
             return dict([(t, t == chosen_topic) for t in self.help_topics])
 
 
-def create_parser(plugins, args):
-    """Create parser."""
+def prepare_and_parse_args(plugins, args):
+    """Returns parsed command line arguments.
+
+    :param .PluginsRegistry plugins: available plugins
+    :param list args: command line arguments with the program name removed
+
+    :returns: parsed command line arguments
+    :rtype: argparse.Namespace
+
+    """
     helpful = HelpfulArgumentParser(args, plugins)
 
     # --help is automatically provided by argparse
@@ -783,7 +825,7 @@ def create_parser(plugins, args):
         "testing", "--no-verify-ssl", action="store_true",
         help=config_help("no_verify_ssl"),
         default=flag_default("no_verify_ssl"))
-    helpful.add(  # TODO: apache plugin does NOT respect it (#479)
+    helpful.add(
         "testing", "--dvsni-port", type=int, default=flag_default("dvsni_port"),
         help=config_help("dvsni_port"))
     helpful.add("testing", "--simple-http-port", type=int,
@@ -792,13 +834,16 @@ def create_parser(plugins, args):
     helpful.add_group(
         "security", description="Security parameters & server settings")
     helpful.add(
-        "security", "-B", "--rsa-key-size", type=int, metavar="N",
+        "security", "--rsa-key-size", type=int, metavar="N",
         default=flag_default("rsa_key_size"), help=config_help("rsa_key_size"))
-    # TODO: resolve - assumes binary logic while client.py assumes ternary.
     helpful.add(
-        "security", "-r", "--redirect", action="store_true",
+        "security", "--redirect", action="store_true",
         help="Automatically redirect all HTTP traffic to HTTPS for the newly "
-             "authenticated vhost.")
+             "authenticated vhost.", dest="redirect", default=None)
+    helpful.add(
+        "security", "--no-redirect", action="store_false",
+        help="Do not automatically redirect all HTTP traffic to HTTPS for the newly "
+             "authenticated vhost.", dest="redirect", default=None)
     helpful.add(
         "security", "--strict-permissions", action="store_true",
         help="Require that all configuration files are owned by the current "
@@ -811,36 +856,10 @@ def create_parser(plugins, args):
 
     _create_subparsers(helpful)
 
-    return helpful.parser, helpful.args
-
-
-# For now unfortunately this constant just needs to match the code below;
-# there isn't an elegant way to autogenerate it in time.
-VERBS = ["run", "auth", "install", "revoke", "rollback", "config_changes", "plugins"]
-HELP_TOPICS = ["all", "security", "paths", "automation", "testing"] + VERBS
+    return helpful.parse_args()
 
 
 def _create_subparsers(helpful):
-    subparsers = helpful.parser.add_subparsers(metavar="SUBCOMMAND")
-
-    def add_subparser(name):  # pylint: disable=missing-docstring
-        if name == "plugins":
-            func = plugins_cmd
-        else:
-            func = eval(name)  # pylint: disable=eval-used
-        h = func.__doc__.splitlines()[0]
-        subparser = subparsers.add_parser(name, help=h, description=func.__doc__)
-        subparser.set_defaults(func=func)
-        return subparser
-
-    # the order of add_subparser() calls is important: it defines the
-    # order in which subparser names will be displayed in --help
-    # these add_subparser objects return objects to which arguments could be
-    # attached, but they have annoying arg ordering constrains so we use
-    # groups instead: https://github.com/letsencrypt/letsencrypt/issues/820
-    for v in VERBS:
-        add_subparser(v)
-
     helpful.add_group("auth", description="Options for modifying how a cert is obtained")
     helpful.add_group("install", description="Options for modifying how a cert is deployed")
     helpful.add_group("revoke", description="Options for revocation of certs")
@@ -849,7 +868,9 @@ def _create_subparsers(helpful):
 
     helpful.add("auth",
                 "--csr", type=read_file,
-                help="Path to a Certificate Signing Request (CSR) in DER format.")
+                help="Path to a Certificate Signing Request (CSR) in DER"
+                " format; note that the .csr file *must* contain a Subject"
+                " Alternative Name field for each domain you want certified.")
     helpful.add("rollback",
                 "--checkpoints", type=int, metavar="N",
                 default=flag_default("rollback_checkpoints"),
@@ -1030,8 +1051,7 @@ def main(cli_args=sys.argv[1:]):
 
     # note: arg parser internally handles --help (and exits afterwards)
     plugins = plugins_disco.PluginsRegistry.find_all()
-    parser, tweaked_cli_args = create_parser(plugins, cli_args)
-    args = parser.parse_args(tweaked_cli_args)
+    args = prepare_and_parse_args(plugins, cli_args)
     config = configuration.NamespaceConfig(args)
     zope.component.provideUtility(config)
 
