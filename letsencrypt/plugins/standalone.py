@@ -72,7 +72,9 @@ class ServerManager(object):
         except socket.error as error:
             raise errors.StandaloneBindError(error, port)
 
-        thread = threading.Thread(target=server.serve_forever2)
+        thread = threading.Thread(
+            # pylint: disable=no-member
+            target=server.serve_forever)
         thread.start()
 
         # if port == 0, then random free port on OS is taken
@@ -90,7 +92,7 @@ class ServerManager(object):
         instance = self._instances[port]
         logger.debug("Stopping server at %s:%d...",
                      *instance.server.socket.getsockname()[:2])
-        instance.server.shutdown2()
+        instance.server.shutdown()
         instance.thread.join()
         del self._instances[port]
 
@@ -140,12 +142,11 @@ class Authenticator(common.Plugin):
     necessary port in order to respond to incoming DVSNI and SimpleHTTP
     challenges from the certificate authority. Therefore, it does not
     rely on any existing server program.
-
     """
     zope.interface.implements(interfaces.IAuthenticator)
     zope.interface.classProvides(interfaces.IPluginFactory)
 
-    description = "Standalone Authenticator"
+    description = "Automatically use a temporary webserver"
 
     def __init__(self, *args, **kwargs):
         super(Authenticator, self).__init__(*args, **kwargs)
@@ -191,7 +192,10 @@ class Authenticator(common.Plugin):
         return necessary_ports
 
     def more_info(self):  # pylint: disable=missing-docstring
-        return self.__doc__
+        return("This authenticator creates its own ephemeral TCP listener "
+                "on the necessary port in order to respond to incoming DVSNI "
+                "and SimpleHTTP challenges from the certificate authority. "
+                "Therefore, it does not rely on any existing server program.")
 
     def prepare(self):  # pylint: disable=missing-docstring
         pass
