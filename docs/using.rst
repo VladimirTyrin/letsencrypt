@@ -127,7 +127,7 @@ Officially supported plugins:
 Plugin     A I Notes and status
 ========== = = ================================================================
 standalone Y N Very stable. Uses port 80 (force by
-               ``--standalone-supported-challenges simpleHttp``) or 443
+               ``--standalone-supported-challenges http-01``) or 443
                (force by ``--standalone-supported-challenges dvsni``).
 apache     Y Y Alpha. Automates Apache installation, works fairly well but on
                Debian-based distributions only for now.
@@ -162,6 +162,9 @@ can automate it slightly by passing necessary flags on the CLI (see
 sure that UI doesn't prompt for any details you can add the command to
 ``crontab`` (make it less than every 90 days to avoid problems, say
 every month).
+
+Please note that the CA will send notification emails to the address
+you provide if you do not renew certificates that are about to expire.
 
 Let's Encrypt is working hard on automating the renewal process. Until
 the tool is ready, we are sorry for the inconvenience!

@@ -152,7 +152,7 @@ the ACME server. From the protocol, there are essentially two
 different types of challenges. Challenges that must be solved by
 individual plugins in order to satisfy domain validation (subclasses
 of `~.DVChallenge`, i.e. `~.challenges.DVSNI`,
-`~.challenges.SimpleHTTPS`, `~.challenges.DNS`) and continuity specific
+`~.challenges.HTTP01`, `~.challenges.DNS`) and continuity specific
 challenges (subclasses of `~.ContinuityChallenge`,
 i.e. `~.challenges.RecoveryToken`, `~.challenges.RecoveryContact`,
 `~.challenges.ProofOfPossession`). Continuity challenges are
@@ -280,8 +280,14 @@ Steps:
 4. Run ``tox -e lint`` to check for pylint errors. Fix any errors.
 5. Run ``tox`` to run the entire test suite including coverage. Fix any errors.
 6. If your code touches communication with an ACME server/Boulder, you
-   should run the integration tests, see `integration`_.
+   should run the integration tests, see `integration`_. See `Known Issues`_
+   for some common failures that have nothing to do with your code.
 7. Submit the PR.
+8. Did your tests pass on Travis? If they didn't, it might not be your fault!
+   See `Known Issues`_. If it's not a known issue, fix any errors.
+
+.. _Known Issues:
+  https://github.com/letsencrypt/letsencrypt/wiki/Known-issues
 
 Updating the documentation
 ==========================
