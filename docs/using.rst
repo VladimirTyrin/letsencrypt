@@ -86,8 +86,15 @@ in ``/etc/letsencrypt/live`` on the host.
 .. _`install Docker`: https://docs.docker.com/userguide/
 
 
-Distro packages
----------------
+Operating System Packages
+--------------------------
+
+**FreeBSD**
+
+  * Port: ``cd /usr/ports/security/py-letsencrypt && make install clean``
+  * Package: ``pkg install py27-letsencrypt``
+
+**Other Operating Systems**
 
 Unfortunately, this is an ongoing effort. If you'd like to package
 Let's Encrypt client for your distribution of choice please have a
@@ -176,7 +183,7 @@ Where are my certificates?
 ==========================
 
 First of all, we encourage you to use Apache or nginx installers, both
-which perform the certificate managemant automatically. If, however,
+which perform the certificate management automatically. If, however,
 you prefer to manage everything by hand, this section provides
 information on where to find necessary files.
 
