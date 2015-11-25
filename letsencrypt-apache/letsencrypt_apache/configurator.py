@@ -8,6 +8,7 @@ import re
 import shutil
 import socket
 import subprocess
+import time
 
 import zope.interface
 
@@ -96,7 +97,7 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
             help="Path to the Apache 'a2enmod' binary.")
         add("init-script", default=constants.CLI_DEFAULTS["init_script"],
             help="Path to the Apache init script (used for server "
-            "reload/restart).")
+            "reload).")
         add("le-vhost-ext", default=constants.CLI_DEFAULTS["le_vhost_ext"],
             help="SSL vhost configuration extension.")
         add("server-root", default=constants.CLI_DEFAULTS["server_root"],
@@ -182,17 +183,14 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
 
         """
         vhost = self.choose_vhost(domain)
+        self._clean_vhost(vhost)
 
         # This is done first so that ssl module is enabled and cert_path,
         # cert_key... can all be parsed appropriately
         self.prepare_server_https("443")
 
-        path = {}
-
-        path["cert_path"] = self.parser.find_dir(
-            "SSLCertificateFile", None, vhost.path)
-        path["cert_key"] = self.parser.find_dir(
-            "SSLCertificateKeyFile", None, vhost.path)
+        path = {"cert_path": self.parser.find_dir("SSLCertificateFile", None, vhost.path),
+                "cert_key": self.parser.find_dir("SSLCertificateKeyFile", None, vhost.path)}
 
         # Only include if a certificate chain is specified
         if chain_path is not None:
@@ -209,16 +207,27 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
                 "Unable to find cert and/or key directives")
 
         logger.info("Deploying Certificate to VirtualHost %s", vhost.filep)
+        logger.debug("Apache version is %s",
+                     ".".join(str(i) for i in self.version))
 
-        # Assign the final directives; order is maintained in find_dir
-        self.aug.set(path["cert_path"][-1], cert_path)
-        self.aug.set(path["cert_key"][-1], key_path)
-        if chain_path is not None:
-            if not path["chain_path"]:
-                self.parser.add_dir(
-                    vhost.path, "SSLCertificateChainFile", chain_path)
+        if self.version < (2, 4, 8) or (chain_path and not fullchain_path):
+            # install SSLCertificateFile, SSLCertificateKeyFile,
+            # and SSLCertificateChainFile directives
+            set_cert_path = cert_path
+            self.aug.set(path["cert_path"][-1], cert_path)
+            self.aug.set(path["cert_key"][-1], key_path)
+            if chain_path is not None:
+                self.parser.add_dir(vhost.path,
+                                    "SSLCertificateChainFile", chain_path)
             else:
-                self.aug.set(path["chain_path"][-1], chain_path)
+                raise errors.PluginError("--chain-path is required for your version of Apache")
+        else:
+            if not fullchain_path:
+                raise errors.PluginError("Please provide the --fullchain-path\
+ option pointing to your full chain file")
+            set_cert_path = fullchain_path
+            self.aug.set(path["cert_path"][-1], fullchain_path)
+            self.aug.set(path["cert_key"][-1], key_path)
 
         # Save notes about the transaction that took place
         self.save_notes += ("Changed vhost at %s with addresses of %s\n"
@@ -226,7 +235,7 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
                             "\tSSLCertificateKeyFile %s\n" %
                             (vhost.filep,
                              ", ".join(str(addr) for addr in vhost.addrs),
-                             cert_path, key_path))
+                             set_cert_path, key_path))
         if chain_path is not None:
             self.save_notes += "\tSSLCertificateChainFile %s\n" % chain_path
 
@@ -410,33 +419,14 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
 
         for alias in serveralias_match:
             serveralias = self.parser.get_arg(alias)
-            if not self._is_mod_macro(serveralias):
+            if not host.modmacro:
                 host.aliases.add(serveralias)
-            else:
-                host.modmacro = True
 
         if servername_match:
             # Get last ServerName as each overwrites the previous
             servername = self.parser.get_arg(servername_match[-1])
-            if not self._is_mod_macro(servername):
+            if not host.modmacro:
                 host.name = servername
-            else:
-                host.modmacro = True
-
-    def _is_mod_macro(self, name):
-        """Helper function for _add_servernames().
-        Checks if the ServerName / ServerAlias belongs to a macro
-
-        :param str name: Name to check and filter out if it's a variable
-
-        :returns: boolean
-        :rtype: boolean
-
-        """
-
-        if "$" in name:
-            return True
-        return False
 
     def _create_vhost(self, path):
         """Used by get_virtual_hosts to create vhost objects
@@ -456,10 +446,21 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
         if self.parser.find_dir("SSLEngine", "on", start=path, exclude=False):
             is_ssl = True
 
+        # "SSLEngine on" might be set outside of <VirtualHost>
+        # Treat vhosts with port 443 as ssl vhosts
+        for addr in addrs:
+            if addr.get_port() == "443":
+                is_ssl = True
+
         filename = get_file_path(path)
         is_enabled = self.is_site_enabled(filename)
 
-        vhost = obj.VirtualHost(filename, path, addrs, is_ssl, is_enabled)
+        macro = False
+        if "/macro/" in path.lower():
+            macro = True
+
+        vhost = obj.VirtualHost(filename, path, addrs, is_ssl,
+                                is_enabled, modmacro=macro)
         self._add_servernames(vhost)
         return vhost
 
@@ -604,7 +605,8 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
                               (ssl_fp, parser.case_i("VirtualHost")))
         if len(vh_p) != 1:
             logger.error("Error: should only be one vhost in %s", avail_fp)
-            raise errors.PluginError("Only one vhost per file is allowed")
+            raise errors.PluginError("Currently, we only support "
+                                     "configurations with one vhost per file")
         else:
             # This simplifies the process
             vh_p = vh_p[0]
@@ -679,6 +681,25 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
             ssl_addrs.add(ssl_addr)
 
         return ssl_addrs
+
+    def _clean_vhost(self, vhost):
+        # remove duplicated or conflicting ssl directives
+        self._deduplicate_directives(vhost.path,
+            ["SSLCertificateFile", "SSLCertificateKeyFile"])
+        # remove all problematic directives
+        self._remove_directives(vhost.path, ["SSLCertificateChainFile"])
+
+    def _deduplicate_directives(self, vh_path, directives):
+        for directive in directives:
+            while len(self.parser.find_dir(directive, None, vh_path, False)) > 1:
+                directive_path = self.parser.find_dir(directive, None, vh_path, False)
+                self.aug.remove(re.sub(r"/\w*$", "", directive_path[0]))
+
+    def _remove_directives(self, vh_path, directives):
+        for directive in directives:
+            while len(self.parser.find_dir(directive, None, vh_path, False)) > 0:
+                directive_path = self.parser.find_dir(directive, None, vh_path, False)
+                self.aug.remove(re.sub(r"/\w*$", "", directive_path[0]))
 
     def _add_dummy_ssl_directives(self, vh_path):
         self.parser.add_dir(vh_path, "SSLCertificateFile",
@@ -992,7 +1013,7 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
         return False
 
     def enable_site(self, vhost):
-        """Enables an available site, Apache restart required.
+        """Enables an available site, Apache reload required.
 
         .. note:: Does not make sure that the site correctly works or that all
                   modules are enabled appropriately.
@@ -1027,7 +1048,7 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
     def enable_mod(self, mod_name, temp=False):
         """Enables module in Apache.
 
-        Both enables and restarts Apache so module is active.
+        Both enables and reloads Apache so module is active.
 
         :param str mod_name: Name of the module to enable. (e.g. 'ssl')
         :param bool temp: Whether or not this is a temporary action.
@@ -1069,7 +1090,7 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
 
         # Modules can enable additional config files. Variables may be defined
         # within these new configuration sections.
-        # Restart is not necessary as DUMP_RUN_CFG uses latest config.
+        # Reload is not necessary as DUMP_RUN_CFG uses latest config.
         self.parser.update_runtime_variables(self.conf("ctl"))
 
     def _add_parser_mod(self, mod_name):
@@ -1092,16 +1113,16 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
         le_util.run_script([self.conf("enmod"), mod_name])
 
     def restart(self):
-        """Restarts apache server.
+        """Reloads apache server.
 
         .. todo:: This function will be converted to using reload
 
-        :raises .errors.MisconfigurationError: If unable to restart due
-            to a configuration problem, or if the restart subprocess
+        :raises .errors.MisconfigurationError: If unable to reload due
+            to a configuration problem, or if the reload subprocess
             cannot be run.
 
         """
-        return apache_restart(self.conf("init-script"))
+        return apache_reload(self.conf("init-script"))
 
     def config_test(self):  # pylint: disable=no-self-use
         """Check the configuration of Apache for errors.
@@ -1176,10 +1197,14 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
 
         sni_response = apache_dvsni.perform()
         if sni_response:
-            # Must restart in order to activate the challenges.
+            # Must reload in order to activate the challenges.
             # Handled here because we may be able to load up other challenge
             # types
             self.restart()
+
+            # TODO: Remove this dirty hack. We need to determine a reliable way
+            # of identifying when the new configuration is being used.
+            time.sleep(3)
 
             # Go through all of the challenges and assign them to the proper
             # place in the responses return value. All responses must be in the
@@ -1219,42 +1244,42 @@ def _get_mod_deps(mod_name):
     return deps.get(mod_name, [])
 
 
-def apache_restart(apache_init_script):
-    """Restarts the Apache Server.
+def apache_reload(apache_init_script):
+    """Reloads the Apache Server.
 
     :param str apache_init_script: Path to the Apache init script.
 
     .. todo:: Try to use reload instead. (This caused timing problems before)
 
     .. todo:: On failure, this should be a recovery_routine call with another
-       restart.  This will confuse and inhibit developers from testing code
+       reload.  This will confuse and inhibit developers from testing code
        though.  This change should happen after
        the ApacheConfigurator has been thoroughly tested.  The function will
        need to be moved into the class again.  Perhaps
        this version can live on... for testing purposes.
 
-    :raises .errors.MisconfigurationError: If unable to restart due to a
-        configuration problem, or if the restart subprocess cannot be run.
+    :raises .errors.MisconfigurationError: If unable to reload due to a
+        configuration problem, or if the reload subprocess cannot be run.
 
     """
     try:
-        proc = subprocess.Popen([apache_init_script, "restart"],
+        proc = subprocess.Popen([apache_init_script, "reload"],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE)
 
     except (OSError, ValueError):
         logger.fatal(
-            "Unable to restart the Apache process with %s", apache_init_script)
+            "Unable to reload the Apache process with %s", apache_init_script)
         raise errors.MisconfigurationError(
-            "Unable to restart Apache process with %s" % apache_init_script)
+            "Unable to reload Apache process with %s" % apache_init_script)
 
     stdout, stderr = proc.communicate()
 
     if proc.returncode != 0:
         # Enter recovery routine...
-        logger.error("Apache Restart Failed!\n%s\n%s", stdout, stderr)
+        logger.error("Apache Reload Failed!\n%s\n%s", stdout, stderr)
         raise errors.MisconfigurationError(
-            "Error while restarting Apache:\n%s\n%s" % (stdout, stderr))
+            "Error while reloading Apache:\n%s\n%s" % (stdout, stderr))
 
 
 def get_file_path(vhost_path):
