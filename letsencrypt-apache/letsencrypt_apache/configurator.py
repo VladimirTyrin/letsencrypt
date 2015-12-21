@@ -1,13 +1,11 @@
 """Apache Configuration based off of Augeas Configurator."""
 # pylint: disable=too-many-lines
 import filecmp
-import itertools
 import logging
 import os
 import re
 import shutil
 import socket
-import subprocess
 import time
 
 import zope.interface
@@ -23,10 +21,11 @@ from letsencrypt.plugins import common
 from letsencrypt_apache import augeas_configurator
 from letsencrypt_apache import constants
 from letsencrypt_apache import display_ops
-from letsencrypt_apache import dvsni
+from letsencrypt_apache import tls_sni_01
 from letsencrypt_apache import obj
 from letsencrypt_apache import parser
 
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -94,14 +93,12 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
         add("enmod", default=constants.CLI_DEFAULTS["enmod"],
             help="Path to the Apache 'a2enmod' binary.")
         add("dismod", default=constants.CLI_DEFAULTS["dismod"],
-            help="Path to the Apache 'a2enmod' binary.")
-        add("init-script", default=constants.CLI_DEFAULTS["init_script"],
-            help="Path to the Apache init script (used for server "
-            "reload).")
+            help="Path to the Apache 'a2dismod' binary.")
         add("le-vhost-ext", default=constants.CLI_DEFAULTS["le_vhost_ext"],
             help="SSL vhost configuration extension.")
         add("server-root", default=constants.CLI_DEFAULTS["server_root"],
             help="Apache server root directory.")
+        le_util.add_deprecated_argument(add, "init-script", 1)
 
     def __init__(self, *args, **kwargs):
         """Initialize an Apache Configurator.
@@ -122,7 +119,8 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
         self.parser = None
         self.version = version
         self.vhosts = None
-        self._enhance_func = {"redirect": self._enable_redirect}
+        self._enhance_func = {"redirect": self._enable_redirect,
+                              "ensure-http-header": self._set_http_header}
 
     @property
     def mod_ssl_conf(self):
@@ -139,8 +137,7 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
 
         """
         # Verify Apache is installed
-        for exe in (self.conf("ctl"), self.conf("enmod"),
-                    self.conf("dismod"), self.conf("init-script")):
+        for exe in (self.conf("ctl"), self.conf("enmod"), self.conf("dismod")):
             if not le_util.exe_exists(exe):
                 raise errors.NoInstallationError
 
@@ -243,13 +240,18 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
         if not vhost.enabled:
             self.enable_site(vhost)
 
-    def choose_vhost(self, target_name):
+    def choose_vhost(self, target_name, temp=False):
         """Chooses a virtual host based on the given domain name.
 
         If there is no clear virtual host to be selected, the user is prompted
         with all available choices.
 
+        The returned vhost is guaranteed to have TLS enabled unless temp is
+        True. If temp is True, there is no such guarantee and the result is
+        not cached.
+
         :param str target_name: domain name
+        :param bool temp: whether the vhost is only used temporarily
 
         :returns: ssl vhost associated with name
         :rtype: :class:`~letsencrypt_apache.obj.VirtualHost`
@@ -264,15 +266,17 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
         # Try to find a reasonable vhost
         vhost = self._find_best_vhost(target_name)
         if vhost is not None:
+            if temp:
+                return vhost
             if not vhost.ssl:
                 vhost = self.make_vhost_ssl(vhost)
 
             self.assoc[target_name] = vhost
             return vhost
 
-        return self._choose_vhost_from_list(target_name)
+        return self._choose_vhost_from_list(target_name, temp)
 
-    def _choose_vhost_from_list(self, target_name):
+    def _choose_vhost_from_list(self, target_name, temp=False):
         # Select a vhost from a list
         vhost = display_ops.select_vhost(target_name, self.vhosts)
         if vhost is None:
@@ -281,7 +285,8 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
                 "No vhost was selected. Please specify servernames "
                 "in the Apache config", target_name)
             raise errors.PluginError("No vhost selected")
-
+        elif temp:
+            return vhost
         elif not vhost.ssl:
             addrs = self._get_proposed_addrs(vhost, "443")
             # TODO: Conflicts is too conservative
@@ -540,21 +545,43 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
 
         # Check for Listen <port>
         # Note: This could be made to also look for ip:443 combo
-        if not self.parser.find_dir("Listen", port):
-            logger.debug("No Listen %s directive found. Setting the "
-                         "Apache Server to Listen on port %s", port, port)
-
-            if port == "443":
-                args = [port]
+        listens = [self.parser.get_arg(x).split()[0] for x in self.parser.find_dir("Listen")]
+        # In case no Listens are set (which really is a broken apache config)
+        if not listens:
+            listens = ["80"]
+        for listen in listens:
+            # For any listen statement, check if the machine also listens on Port 443.
+            # If not, add such a listen statement.
+            if len(listen.split(":")) == 1:
+                # Its listening to all interfaces
+                if port not in listens:
+                    if port == "443":
+                        args = [port]
+                    else:
+                        # Non-standard ports should specify https protocol
+                        args = [port, "https"]
+                    self.parser.add_dir_to_ifmodssl(
+                        parser.get_aug_path(
+                            self.parser.loc["listen"]), "Listen", args)
+                    self.save_notes += "Added Listen %s directive to %s\n" % (
+                        port, self.parser.loc["listen"])
+                    listens.append(port)
             else:
-                # Non-standard ports should specify https protocol
-                args = [port, "https"]
-
-            self.parser.add_dir_to_ifmodssl(
-                parser.get_aug_path(
-                    self.parser.loc["listen"]), "Listen", args)
-            self.save_notes += "Added Listen %s directive to %s\n" % (
-                port, self.parser.loc["listen"])
+                # The Listen statement specifies an ip
+                _, ip = listen[::-1].split(":", 1)
+                ip = ip[::-1]
+                if "%s:%s" % (ip, port) not in listens:
+                    if port == "443":
+                        args = ["%s:%s" % (ip, port)]
+                    else:
+                        # Non-standard ports should specify https protocol
+                        args = ["%s:%s" % (ip, port), "https"]
+                    self.parser.add_dir_to_ifmodssl(
+                        parser.get_aug_path(
+                            self.parser.loc["listen"]), "Listen", args)
+                    self.save_notes += "Added Listen %s:%s directive to %s\n" % (
+                                       ip, port, self.parser.loc["listen"])
+                    listens.append("%s:%s" % (ip, port))
 
     def make_addrs_sni_ready(self, addrs):
         """Checks to see if the server is ready for SNI challenges.
@@ -739,7 +766,7 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
     ############################################################################
     def supported_enhancements(self):  # pylint: disable=no-self-use
         """Returns currently supported enhancements."""
-        return ["redirect"]
+        return ["redirect", "ensure-http-header"]
 
     def enhance(self, domain, enhancement, options=None):
         """Enhance configuration.
@@ -765,6 +792,73 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
         except errors.PluginError:
             logger.warn("Failed %s for %s", enhancement, domain)
             raise
+
+    def _set_http_header(self, ssl_vhost, header_substring):
+        """Enables header that is identified by header_substring on ssl_vhost.
+
+        If the header identified by header_substring is not already set,
+        a new Header directive is placed in ssl_vhost's configuration with
+        arguments from: constants.HTTP_HEADER[header_substring]
+
+        .. note:: This function saves the configuration
+
+        :param ssl_vhost: Destination of traffic, an ssl enabled vhost
+        :type ssl_vhost: :class:`~letsencrypt_apache.obj.VirtualHost`
+
+        :param header_substring: string that uniquely identifies a header.
+                e.g: Strict-Transport-Security, Upgrade-Insecure-Requests.
+        :type str
+
+        :returns: Success, general_vhost (HTTP vhost)
+        :rtype: (bool, :class:`~letsencrypt_apache.obj.VirtualHost`)
+
+        :raises .errors.PluginError: If no viable HTTP host can be created or
+            set with header header_substring.
+
+        """
+        if "headers_module" not in self.parser.modules:
+            self.enable_mod("headers")
+
+        # Check if selected header is already set
+        self._verify_no_matching_http_header(ssl_vhost, header_substring)
+
+        # Add directives to server
+        self.parser.add_dir(ssl_vhost.path, "Header",
+                constants.HEADER_ARGS[header_substring])
+
+        self.save_notes += ("Adding %s header to ssl vhost in %s\n" %
+                (header_substring, ssl_vhost.filep))
+
+        self.save()
+        logger.info("Adding %s header to ssl vhost in %s", header_substring,
+                ssl_vhost.filep)
+
+    def _verify_no_matching_http_header(self, ssl_vhost, header_substring):
+        """Checks to see if an there is an existing Header directive that
+        contains the string header_substring.
+
+        :param ssl_vhost: vhost to check
+        :type vhost: :class:`~letsencrypt_apache.obj.VirtualHost`
+
+        :param header_substring: string that uniquely identifies a header.
+                e.g: Strict-Transport-Security, Upgrade-Insecure-Requests.
+        :type str
+
+        :returns: boolean
+        :rtype: (bool)
+
+        :raises errors.PluginEnhancementAlreadyPresent When header
+                header_substring exists
+
+        """
+        header_path = self.parser.find_dir("Header", None, start=ssl_vhost.path)
+        if header_path:
+            # "Existing Header directive for virtualhost"
+            pat = '(?:[ "]|^)(%s)(?:[ "]|$)' % (header_substring.lower())
+            for match in header_path:
+                if re.search(pat, self.aug.get(match).lower()):
+                    raise errors.PluginEnhancementAlreadyPresent(
+                            "Existing %s header" % (header_substring))
 
     def _enable_redirect(self, ssl_vhost, unused_options):
         """Redirect all equivalent HTTP traffic to ssl_vhost.
@@ -810,15 +904,33 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
                         "redirection")
             self._create_redirect_vhost(ssl_vhost)
         else:
-            # Check if redirection already exists
-            self._verify_no_redirects(general_vh)
+            # Check if LetsEncrypt redirection already exists
+            self._verify_no_letsencrypt_redirect(general_vh)
+
+
+            # Note: if code flow gets here it means we didn't find the exact
+            # letsencrypt RewriteRule config for redirection. Finding
+            # another RewriteRule is likely to be fine in most or all cases,
+            # but redirect loops are possible in very obscure cases; see #1620
+            # for reasoning.
+            if self._is_rewrite_exists(general_vh):
+                logger.warn("Added an HTTP->HTTPS rewrite in addition to "
+                            "other RewriteRules; you may wish to check for "
+                            "overall consistency.")
 
             # Add directives to server
             # Note: These are not immediately searchable in sites-enabled
             #     even with save() and load()
-            self.parser.add_dir(general_vh.path, "RewriteEngine", "on")
-            self.parser.add_dir(general_vh.path, "RewriteRule",
+            if not self._is_rewrite_engine_on(general_vh):
+                self.parser.add_dir(general_vh.path, "RewriteEngine", "on")
+
+            if self.get_version() >= (2, 3, 9):
+                self.parser.add_dir(general_vh.path, "RewriteRule",
+                                constants.REWRITE_HTTPS_ARGS_WITH_END)
+            else:
+                self.parser.add_dir(general_vh.path, "RewriteRule",
                                 constants.REWRITE_HTTPS_ARGS)
+
             self.save_notes += ("Redirecting host in %s to ssl vhost in %s\n" %
                                 (general_vh.filep, ssl_vhost.filep))
             self.save()
@@ -826,35 +938,67 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
             logger.info("Redirecting vhost in %s to ssl vhost in %s",
                         general_vh.filep, ssl_vhost.filep)
 
-    def _verify_no_redirects(self, vhost):
-        """Checks to see if existing redirect is in place.
+    def _verify_no_letsencrypt_redirect(self, vhost):
+        """Checks to see if a redirect was already installed by letsencrypt.
 
-        Checks to see if virtualhost already contains a rewrite or redirect
-        returns boolean, integer
+        Checks to see if virtualhost already contains a rewrite rule that is
+        identical to Letsencrypt's redirection rewrite rule.
 
         :param vhost: vhost to check
         :type vhost: :class:`~letsencrypt_apache.obj.VirtualHost`
 
-        :raises errors.PluginError: When another redirection exists
+        :raises errors.PluginEnhancementAlreadyPresent: When the exact
+                letsencrypt redirection WriteRule exists in virtual host.
+        """
+        rewrite_path = self.parser.find_dir(
+                "RewriteRule", None, start=vhost.path)
+
+        # There can be other RewriteRule directive lines in vhost config.
+        # rewrite_args_dict keys are directive ids and the corresponding value
+        # for each is a list of arguments to that directive.
+        rewrite_args_dict = defaultdict(list)
+        pat = r'.*(directive\[\d+\]).*'
+        for match in rewrite_path:
+            m = re.match(pat, match)
+            if m:
+                dir_id = m.group(1)
+                rewrite_args_dict[dir_id].append(match)
+
+        if rewrite_args_dict:
+            redirect_args = [constants.REWRITE_HTTPS_ARGS,
+                constants.REWRITE_HTTPS_ARGS_WITH_END]
+
+            for matches in rewrite_args_dict.values():
+                if [self.aug.get(x) for x in matches] in redirect_args:
+                    raise errors.PluginEnhancementAlreadyPresent(
+                    "Let's Encrypt has already enabled redirection")
+
+    def _is_rewrite_exists(self, vhost):
+        """Checks if there exists a RewriteRule directive in vhost
+
+        :param vhost: vhost to check
+        :type vhost: :class:`~letsencrypt_apache.obj.VirtualHost`
+
+        :returns: True if a RewriteRule directive exists.
+        :rtype: bool
 
         """
         rewrite_path = self.parser.find_dir(
-            "RewriteRule", None, start=vhost.path)
-        redirect_path = self.parser.find_dir("Redirect", None, start=vhost.path)
+                "RewriteRule", None, start=vhost.path)
+        return bool(rewrite_path)
 
-        if redirect_path:
-            # "Existing Redirect directive for virtualhost"
-            raise errors.PluginError("Existing Redirect present on HTTP vhost.")
-        if rewrite_path:
-            # "No existing redirection for virtualhost"
-            if len(rewrite_path) != len(constants.REWRITE_HTTPS_ARGS):
-                raise errors.PluginError("Unknown Existing RewriteRule")
-            for match, arg in itertools.izip(
-                    rewrite_path, constants.REWRITE_HTTPS_ARGS):
-                if self.aug.get(match) != arg:
-                    raise errors.PluginError("Unknown Existing RewriteRule")
-            raise errors.PluginError(
-                "Let's Encrypt has already enabled redirection")
+    def _is_rewrite_engine_on(self, vhost):
+        """Checks if a RewriteEngine directive is on
+
+        :param vhost: vhost to check
+        :type vhost: :class:`~letsencrypt_apache.obj.VirtualHost`
+
+        """
+        rewrite_engine_path = self.parser.find_dir("RewriteEngine", "on",
+                start=vhost.path)
+        if rewrite_engine_path:
+            return self.parser.get_arg(rewrite_engine_path[0])
+        return False
 
     def _create_redirect_vhost(self, ssl_vhost):
         """Creates an http_vhost specifically to redirect for the ssl_vhost.
@@ -891,6 +1035,13 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
         if ssl_vhost.aliases:
             serveralias = "ServerAlias " + " ".join(ssl_vhost.aliases)
 
+        rewrite_rule_args = []
+        if self.get_version() >= (2, 3, 9):
+            rewrite_rule_args = constants.REWRITE_HTTPS_ARGS_WITH_END
+        else:
+            rewrite_rule_args = constants.REWRITE_HTTPS_ARGS
+
+
         return ("<VirtualHost %s>\n"
                 "%s \n"
                 "%s \n"
@@ -904,7 +1055,7 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
                 "</VirtualHost>\n"
                 % (" ".join(str(addr) for addr in self._get_proposed_addrs(ssl_vhost)),
                    servername, serveralias,
-                   " ".join(constants.REWRITE_HTTPS_ARGS)))
+                   " ".join(rewrite_rule_args)))
 
     def _write_out_redirect(self, ssl_vhost, text):
         # This is the default name
@@ -1113,16 +1264,25 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
         le_util.run_script([self.conf("enmod"), mod_name])
 
     def restart(self):
-        """Reloads apache server.
+        """Runs a config test and reloads the Apache server.
 
-        .. todo:: This function will be converted to using reload
-
-        :raises .errors.MisconfigurationError: If unable to reload due
-            to a configuration problem, or if the reload subprocess
-            cannot be run.
+        :raises .errors.MisconfigurationError: If either the config test
+            or reload fails.
 
         """
-        return apache_reload(self.conf("init-script"))
+        self.config_test()
+        self._reload()
+
+    def _reload(self):
+        """Reloads the Apache server.
+
+        :raises .errors.MisconfigurationError: If reload fails
+
+        """
+        try:
+            le_util.run_script([self.conf("ctl"), "-k", "graceful"])
+        except errors.SubprocessError as err:
+            raise errors.MisconfigurationError(str(err))
 
     def config_test(self):  # pylint: disable=no-self-use
         """Check the configuration of Apache for errors.
@@ -1187,15 +1347,15 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
         """
         self._chall_out.update(achalls)
         responses = [None] * len(achalls)
-        apache_dvsni = dvsni.ApacheDvsni(self)
+        chall_doer = tls_sni_01.ApacheTlsSni01(self)
 
         for i, achall in enumerate(achalls):
-            # Currently also have dvsni hold associated index
-            # of the challenge. This helps to put all of the responses back
-            # together when they are all complete.
-            apache_dvsni.add_chall(achall, i)
+            # Currently also have chall_doer hold associated index of the
+            # challenge. This helps to put all of the responses back together
+            # when they are all complete.
+            chall_doer.add_chall(achall, i)
 
-        sni_response = apache_dvsni.perform()
+        sni_response = chall_doer.perform()
         if sni_response:
             # Must reload in order to activate the challenges.
             # Handled here because we may be able to load up other challenge
@@ -1210,7 +1370,7 @@ class ApacheConfigurator(augeas_configurator.AugeasConfigurator):
             # place in the responses return value. All responses must be in the
             # same order as the original challenges.
             for i, resp in enumerate(sni_response):
-                responses[apache_dvsni.indices[i]] = resp
+                responses[chall_doer.indices[i]] = resp
 
         return responses
 
@@ -1242,44 +1402,6 @@ def _get_mod_deps(mod_name):
         "ssl": ["setenvif", "mime", "socache_shmcb"]
     }
     return deps.get(mod_name, [])
-
-
-def apache_reload(apache_init_script):
-    """Reloads the Apache Server.
-
-    :param str apache_init_script: Path to the Apache init script.
-
-    .. todo:: Try to use reload instead. (This caused timing problems before)
-
-    .. todo:: On failure, this should be a recovery_routine call with another
-       reload.  This will confuse and inhibit developers from testing code
-       though.  This change should happen after
-       the ApacheConfigurator has been thoroughly tested.  The function will
-       need to be moved into the class again.  Perhaps
-       this version can live on... for testing purposes.
-
-    :raises .errors.MisconfigurationError: If unable to reload due to a
-        configuration problem, or if the reload subprocess cannot be run.
-
-    """
-    try:
-        proc = subprocess.Popen([apache_init_script, "reload"],
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE)
-
-    except (OSError, ValueError):
-        logger.fatal(
-            "Unable to reload the Apache process with %s", apache_init_script)
-        raise errors.MisconfigurationError(
-            "Unable to reload Apache process with %s" % apache_init_script)
-
-    stdout, stderr = proc.communicate()
-
-    if proc.returncode != 0:
-        # Enter recovery routine...
-        logger.error("Apache Reload Failed!\n%s\n%s", stdout, stderr)
-        raise errors.MisconfigurationError(
-            "Error while reloading Apache:\n%s\n%s" % (stdout, stderr))
 
 
 def get_file_path(vhost_path):

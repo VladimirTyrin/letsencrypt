@@ -140,6 +140,12 @@ class TwoVhost80Test(util.ApacheTest):
         self.assertTrue(chosen_vhost.ssl)
 
     @mock.patch("letsencrypt_apache.display_ops.select_vhost")
+    def test_choose_vhost_select_vhost_with_temp(self, mock_select):
+        mock_select.return_value = self.vh_truth[0]
+        chosen_vhost = self.config.choose_vhost("none.com", temp=True)
+        self.assertEqual(self.vh_truth[0], chosen_vhost)
+
+    @mock.patch("letsencrypt_apache.display_ops.select_vhost")
     def test_choose_vhost_select_vhost_conflicting_non_ssl(self, mock_select):
         mock_select.return_value = self.vh_truth[3]
         conflicting_vhost = obj.VirtualHost(
@@ -385,6 +391,39 @@ class TwoVhost80Test(util.ApacheTest):
 
         self.assertEqual(mock_add_dir.call_count, 2)
 
+    def test_prepare_server_https_named_listen(self):
+        mock_find = mock.Mock()
+        mock_find.return_value = ["test1", "test2", "test3"]
+        mock_get = mock.Mock()
+        mock_get.side_effect = ["1.2.3.4:80", "[::1]:80", "1.1.1.1:443"]
+        mock_add_dir = mock.Mock()
+        mock_enable = mock.Mock()
+
+        self.config.parser.find_dir = mock_find
+        self.config.parser.get_arg = mock_get
+        self.config.parser.add_dir_to_ifmodssl = mock_add_dir
+        self.config.enable_mod = mock_enable
+
+        # Test Listen statements with specific ip listeed
+        self.config.prepare_server_https("443")
+        # Should only be 2 here, as the third interface already listens to the correct port
+        self.assertEqual(mock_add_dir.call_count, 2)
+
+        # Check argument to new Listen statements
+        self.assertEqual(mock_add_dir.call_args_list[0][0][2], ["1.2.3.4:443"])
+        self.assertEqual(mock_add_dir.call_args_list[1][0][2], ["[::1]:443"])
+
+        # Reset return lists and inputs
+        mock_add_dir.reset_mock()
+        mock_get.side_effect = ["1.2.3.4:80", "[::1]:80", "1.1.1.1:443"]
+
+        # Test
+        self.config.prepare_server_https("8080", temp=True)
+        self.assertEqual(mock_add_dir.call_count, 3)
+        self.assertEqual(mock_add_dir.call_args_list[0][0][2], ["1.2.3.4:8080", "https"])
+        self.assertEqual(mock_add_dir.call_args_list[1][0][2], ["[::1]:8080", "https"])
+        self.assertEqual(mock_add_dir.call_args_list[2][0][2], ["1.1.1.1:8080", "https"])
+
     def test_make_vhost_ssl(self):
         ssl_vhost = self.config.make_vhost_ssl(self.vh_truth[0])
 
@@ -497,23 +536,23 @@ class TwoVhost80Test(util.ApacheTest):
         self.config._add_name_vhost_if_necessary(self.vh_truth[0])
         self.assertTrue(self.config.save.called)
 
-    @mock.patch("letsencrypt_apache.configurator.dvsni.ApacheDvsni.perform")
+    @mock.patch("letsencrypt_apache.configurator.tls_sni_01.ApacheTlsSni01.perform")
     @mock.patch("letsencrypt_apache.configurator.ApacheConfigurator.restart")
-    def test_perform(self, mock_restart, mock_dvsni_perform):
+    def test_perform(self, mock_restart, mock_perform):
         # Only tests functionality specific to configurator.perform
         # Note: As more challenges are offered this will have to be expanded
         account_key, achall1, achall2 = self.get_achalls()
 
-        dvsni_ret_val = [
+        expected = [
             achall1.response(account_key),
             achall2.response(account_key),
         ]
 
-        mock_dvsni_perform.return_value = dvsni_ret_val
+        mock_perform.return_value = expected
         responses = self.config.perform([achall1, achall2])
 
-        self.assertEqual(mock_dvsni_perform.call_count, 1)
-        self.assertEqual(responses, dvsni_ret_val)
+        self.assertEqual(mock_perform.call_count, 1)
+        self.assertEqual(responses, expected)
 
         self.assertEqual(mock_restart.call_count, 1)
 
@@ -563,24 +602,13 @@ class TwoVhost80Test(util.ApacheTest):
         mock_script.side_effect = errors.SubprocessError("Can't find program")
         self.assertRaises(errors.PluginError, self.config.get_version)
 
-    @mock.patch("letsencrypt_apache.configurator.subprocess.Popen")
-    def test_restart(self, mock_popen):
-        """These will be changed soon enough with reload."""
-        mock_popen().returncode = 0
-        mock_popen().communicate.return_value = ("", "")
-
+    @mock.patch("letsencrypt_apache.configurator.le_util.run_script")
+    def test_restart(self, _):
         self.config.restart()
 
-    @mock.patch("letsencrypt_apache.configurator.subprocess.Popen")
-    def test_restart_bad_process(self, mock_popen):
-        mock_popen.side_effect = OSError
-
-        self.assertRaises(errors.MisconfigurationError, self.config.restart)
-
-    @mock.patch("letsencrypt_apache.configurator.subprocess.Popen")
-    def test_restart_failure(self, mock_popen):
-        mock_popen().communicate.return_value = ("", "")
-        mock_popen().returncode = 1
+    @mock.patch("letsencrypt_apache.configurator.le_util.run_script")
+    def test_restart_bad_process(self, mock_run_script):
+        mock_run_script.side_effect = [None, errors.SubprocessError]
 
         self.assertRaises(errors.MisconfigurationError, self.config.restart)
 
@@ -625,6 +653,19 @@ class TwoVhost80Test(util.ApacheTest):
     def test_supported_enhancements(self):
         self.assertTrue(isinstance(self.config.supported_enhancements(), list))
 
+
+    @mock.patch("letsencrypt.le_util.exe_exists")
+    def test_enhance_unknown_vhost(self, mock_exe):
+        self.config.parser.modules.add("rewrite_module")
+        mock_exe.return_value = True
+        ssl_vh = obj.VirtualHost(
+            "fp", "ap", set([obj.Addr(("*", "443")), obj.Addr(("satoshi.com",))]),
+            True, False)
+        self.config.vhosts.append(ssl_vh)
+        self.assertRaises(
+            errors.PluginError,
+            self.config.enhance, "satoshi.com", "redirect")
+
     def test_enhance_unknown_enhancement(self):
         self.assertRaises(
             errors.PluginError,
@@ -632,9 +673,89 @@ class TwoVhost80Test(util.ApacheTest):
 
     @mock.patch("letsencrypt.le_util.run_script")
     @mock.patch("letsencrypt.le_util.exe_exists")
+    def test_http_header_hsts(self, mock_exe, _):
+        self.config.parser.update_runtime_variables = mock.Mock()
+        self.config.parser.modules.add("mod_ssl.c")
+        mock_exe.return_value = True
+
+        # This will create an ssl vhost for letsencrypt.demo
+        self.config.enhance("letsencrypt.demo", "ensure-http-header",
+                "Strict-Transport-Security")
+
+        self.assertTrue("headers_module" in self.config.parser.modules)
+
+        # Get the ssl vhost for letsencrypt.demo
+        ssl_vhost = self.config.assoc["letsencrypt.demo"]
+
+        # These are not immediately available in find_dir even with save() and
+        # load(). They must be found in sites-available
+        hsts_header = self.config.parser.find_dir(
+                "Header", None, ssl_vhost.path)
+
+        # four args to HSTS header
+        self.assertEqual(len(hsts_header), 4)
+
+    def test_http_header_hsts_twice(self):
+        self.config.parser.modules.add("mod_ssl.c")
+        # skip the enable mod
+        self.config.parser.modules.add("headers_module")
+
+        # This will create an ssl vhost for letsencrypt.demo
+        self.config.enhance("encryption-example.demo", "ensure-http-header",
+                "Strict-Transport-Security")
+
+        self.assertRaises(
+            errors.PluginEnhancementAlreadyPresent,
+            self.config.enhance, "encryption-example.demo", "ensure-http-header",
+            "Strict-Transport-Security")
+
+    @mock.patch("letsencrypt.le_util.run_script")
+    @mock.patch("letsencrypt.le_util.exe_exists")
+    def test_http_header_uir(self, mock_exe, _):
+        self.config.parser.update_runtime_variables = mock.Mock()
+        self.config.parser.modules.add("mod_ssl.c")
+        mock_exe.return_value = True
+
+        # This will create an ssl vhost for letsencrypt.demo
+        self.config.enhance("letsencrypt.demo", "ensure-http-header",
+                "Upgrade-Insecure-Requests")
+
+        self.assertTrue("headers_module" in self.config.parser.modules)
+
+        # Get the ssl vhost for letsencrypt.demo
+        ssl_vhost = self.config.assoc["letsencrypt.demo"]
+
+        # These are not immediately available in find_dir even with save() and
+        # load(). They must be found in sites-available
+        uir_header = self.config.parser.find_dir(
+                "Header", None, ssl_vhost.path)
+
+        # four args to HSTS header
+        self.assertEqual(len(uir_header), 4)
+
+    def test_http_header_uir_twice(self):
+        self.config.parser.modules.add("mod_ssl.c")
+        # skip the enable mod
+        self.config.parser.modules.add("headers_module")
+
+        # This will create an ssl vhost for letsencrypt.demo
+        self.config.enhance("encryption-example.demo", "ensure-http-header",
+                "Upgrade-Insecure-Requests")
+
+        self.assertRaises(
+            errors.PluginEnhancementAlreadyPresent,
+            self.config.enhance, "encryption-example.demo", "ensure-http-header",
+            "Upgrade-Insecure-Requests")
+
+
+
+    @mock.patch("letsencrypt.le_util.run_script")
+    @mock.patch("letsencrypt.le_util.exe_exists")
     def test_redirect_well_formed_http(self, mock_exe, _):
         self.config.parser.update_runtime_variables = mock.Mock()
         mock_exe.return_value = True
+        self.config.get_version = mock.Mock(return_value=(2, 2))
+
         # This will create an ssl vhost for letsencrypt.demo
         self.config.enhance("letsencrypt.demo", "redirect")
 
@@ -654,6 +775,55 @@ class TwoVhost80Test(util.ApacheTest):
 
         self.assertTrue("rewrite_module" in self.config.parser.modules)
 
+    def test_rewrite_rule_exists(self):
+        # Skip the enable mod
+        self.config.parser.modules.add("rewrite_module")
+        self.config.get_version = mock.Mock(return_value=(2, 3, 9))
+        self.config.parser.add_dir(
+            self.vh_truth[3].path, "RewriteRule", ["Unknown"])
+        self.assertTrue(self.config._is_rewrite_exists(self.vh_truth[3])) # pylint: disable=protected-access
+
+    def test_rewrite_engine_exists(self):
+        # Skip the enable mod
+        self.config.parser.modules.add("rewrite_module")
+        self.config.get_version = mock.Mock(return_value=(2, 3, 9))
+        self.config.parser.add_dir(
+            self.vh_truth[3].path, "RewriteEngine", "on")
+        self.assertTrue(self.config._is_rewrite_engine_on(self.vh_truth[3])) # pylint: disable=protected-access
+
+
+    @mock.patch("letsencrypt.le_util.run_script")
+    @mock.patch("letsencrypt.le_util.exe_exists")
+    def test_redirect_with_existing_rewrite(self, mock_exe, _):
+        self.config.parser.update_runtime_variables = mock.Mock()
+        mock_exe.return_value = True
+        self.config.get_version = mock.Mock(return_value=(2, 2))
+
+        # Create a preexisting rewrite rule
+        self.config.parser.add_dir(
+            self.vh_truth[3].path, "RewriteRule", ["Unknown"])
+        self.config.save()
+
+        # This will create an ssl vhost for letsencrypt.demo
+        self.config.enhance("letsencrypt.demo", "redirect")
+
+        # These are not immediately available in find_dir even with save() and
+        # load(). They must be found in sites-available
+        rw_engine = self.config.parser.find_dir(
+            "RewriteEngine", "on", self.vh_truth[3].path)
+        rw_rule = self.config.parser.find_dir(
+            "RewriteRule", None, self.vh_truth[3].path)
+
+        self.assertEqual(len(rw_engine), 1)
+        # three args to rw_rule + 1 arg for the pre existing rewrite
+        self.assertEqual(len(rw_rule), 4)
+
+        self.assertTrue(rw_engine[0].startswith(self.vh_truth[3].path))
+        self.assertTrue(rw_rule[0].startswith(self.vh_truth[3].path))
+
+        self.assertTrue("rewrite_module" in self.config.parser.modules)
+
+
     def test_redirect_with_conflict(self):
         self.config.parser.modules.add("rewrite_module")
         ssl_vh = obj.VirtualHost(
@@ -668,49 +838,33 @@ class TwoVhost80Test(util.ApacheTest):
     def test_redirect_twice(self):
         # Skip the enable mod
         self.config.parser.modules.add("rewrite_module")
+        self.config.get_version = mock.Mock(return_value=(2, 3, 9))
+
         self.config.enhance("encryption-example.demo", "redirect")
         self.assertRaises(
-            errors.PluginError,
+            errors.PluginEnhancementAlreadyPresent,
             self.config.enhance, "encryption-example.demo", "redirect")
-
-    def test_unknown_rewrite(self):
-        # Skip the enable mod
-        self.config.parser.modules.add("rewrite_module")
-        self.config.parser.add_dir(
-            self.vh_truth[3].path, "RewriteRule", ["Unknown"])
-        self.config.save()
-        self.assertRaises(
-            errors.PluginError,
-            self.config.enhance, "letsencrypt.demo", "redirect")
-
-    def test_unknown_rewrite2(self):
-        # Skip the enable mod
-        self.config.parser.modules.add("rewrite_module")
-        self.config.parser.add_dir(
-            self.vh_truth[3].path, "RewriteRule", ["Unknown", "2", "3"])
-        self.config.save()
-        self.assertRaises(
-            errors.PluginError,
-            self.config.enhance, "letsencrypt.demo", "redirect")
-
-    def test_unknown_redirect(self):
-        # Skip the enable mod
-        self.config.parser.modules.add("rewrite_module")
-        self.config.parser.add_dir(
-            self.vh_truth[3].path, "Redirect", ["Unknown"])
-        self.config.save()
-        self.assertRaises(
-            errors.PluginError,
-            self.config.enhance, "letsencrypt.demo", "redirect")
 
     def test_create_own_redirect(self):
         self.config.parser.modules.add("rewrite_module")
+        self.config.get_version = mock.Mock(return_value=(2, 3, 9))
         # For full testing... give names...
         self.vh_truth[1].name = "default.com"
         self.vh_truth[1].aliases = set(["yes.default.com"])
 
         self.config._enable_redirect(self.vh_truth[1], "")  # pylint: disable=protected-access
         self.assertEqual(len(self.config.vhosts), 7)
+
+    def test_create_own_redirect_for_old_apache_version(self):
+        self.config.parser.modules.add("rewrite_module")
+        self.config.get_version = mock.Mock(return_value=(2, 2))
+        # For full testing... give names...
+        self.vh_truth[1].name = "default.com"
+        self.vh_truth[1].aliases = set(["yes.default.com"])
+
+        self.config._enable_redirect(self.vh_truth[1], "")  # pylint: disable=protected-access
+        self.assertEqual(len(self.config.vhosts), 7)
+
 
     def get_achalls(self):
         """Return testing achallenges."""

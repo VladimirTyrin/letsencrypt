@@ -4,7 +4,7 @@ from setuptools import setup
 from setuptools import find_packages
 
 
-version = '0.1.0.dev0'
+version = '0.2.0.dev0'
 
 install_requires = [
     # load_pem_private/public_key (>=0.6)
@@ -17,7 +17,7 @@ install_requires = [
     'pyrfc3339',
     'pytz',
     'requests',
-    'setuptools==18.5',  # pkg_resources
+    'setuptools',  # pkg_resources
     'six',
     'werkzeug',
 ]
