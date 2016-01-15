@@ -392,7 +392,7 @@ def _auth_from_domains(le_client, config, domains):
         # TODO: Check whether it worked! <- or make sure errors are thrown (jdk)
         lineage.save_successor(
             lineage.latest_common_version(), OpenSSL.crypto.dump_certificate(
-                OpenSSL.crypto.FILETYPE_PEM, new_certr.body),
+                OpenSSL.crypto.FILETYPE_PEM, new_certr.body.wrapped),
             new_key.pem, crypto_util.dump_pyopenssl_chain(new_chain))
 
         lineage.update_all_links_to(lineage.latest_common_version())
@@ -1189,7 +1189,7 @@ def _plugins_parsing(helpful, plugins):
 
     # These would normally be a flag within the webroot plugin, but because
     # they are parsed in conjunction with --domains, they live here for
-    # legibiility. helpful.add_plugin_ags must be called first to add the
+    # legibility. helpful.add_plugin_ags must be called first to add the
     # "webroot" topic
     helpful.add("webroot", "-w", "--webroot-path", action=WebrootPathProcessor,
                 help="public_html / webroot path. This can be specified multiple times to "
